@@ -1,66 +1,41 @@
-# operatore.py — Scheda Operatore: confronto per operatore + export HTML (barre per attività selezionate)
+# eda.py
+# EDA – usa tutte le righe di ogni tabella. Niente range date mostrato.
+# Filtri globali (multiselect) sotto "Schema attivo": Mese, Attività, Operatore.
+# In fondo: due pulsanti fucsia affiancati "Scarica HTML" e "Home".
+
 from __future__ import annotations
-from typing import List, Optional, Dict, Tuple
-import io, time, re, unicodedata
-from pathlib import Path
+
+from typing import List, Tuple, Optional
+import time, re, io
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from pathlib import Path
 
-# ====== COSTANTI / PALETTE ======
+# ================== CONFIG ==================
 FALLBACK_SCHEMA = "aedbdata"
-ROW_LIMIT_PER_TABLE = 0
+ROW_LIMIT_PER_TABLE = 0  # 0 = usa tutte le righe
 DARK_BG = "#0f1113"
-FUXIA  = "#ff00ff"
-GREEN  = "#00ff66"
-ORANGE = "#ffa500"
-CADUTI = "#4b5563"
-BLUE   = "#3b82f6"
-TEAL   = "#14b8a6"
-YELLOW = "#f97316"
-PINK   = "#e11d48"
-CYAN   = "#22d3ee"
-VIOLET = "#a78bfa"
-COMP_COLORS = [BLUE, TEAL, YELLOW, PINK, CYAN, VIOLET, "#ef4444", "#10b981", "#64748b"]
+HIST_BINS = 30
+LABEL_WRAP = 16
+MIN_VALID_FOR_COL = 3
+MIN_DATE_VALID = 30
 
-# ====== ALIAS ======
-def _norm(s: str) -> str:
-    if s is None: return ""
-    s = unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode("ascii")
-    s = s.replace(".", " ").replace("%", " ").replace("/", " ")
-    s = s.replace("(", " ").replace(")", " ").replace("-", " ").replace("_", " ")
-    return re.sub(r"\s+", " ", s).strip().lower()
+# alias colonne per filtri
+ALIAS_DATA = ["Data","data","date","Date","timestamp","Timestamp","datetime","dt","created_at","createdAt"]
+ALIAS_ATT  = ["Attivita","attivita","Attività","attività","Activity","Categoria","TipoAttivita","Tipo","Task"]
+ALIAS_OP   = ["Operatore","operatore","User","Agent","Utente","OperatoreNome","Operatore_Nome"]
 
-ALIAS_DATA  = [_norm(x) for x in ["Data","date","timestamp","datetime","dt","created_at","createdAt"]]
-ALIAS_ATT   = [_norm(x) for x in ["Attivita","attività","Activity","Categoria","TipoAttivita","Tipo","Task"]]
-ALIAS_OP    = [_norm(x) for x in ["Operatore","User","Agent","Utente","OperatoreNome","Operatore_Nome"]]
-ALIAS_LAV   = [_norm(x) for x in [
-    "Lavorazione generale","Lavorazione  generale","lavorazionegenerale",
-    "tot_lavorazione","tot_lavorazioni","tempo_lavorazione","tempo_lavorazione_generale",
-    "lavorazione_totale","lav_generale","lav_generali"
-]]
-ALIAS_CONV  = [_norm(x) for x in [
-    "Conversazione","conversazioni","ore_conversazione","h_conversazione",
-    "durata_conversazione","conversazioni_ore","tempo_conversazione","talk_time"
-]]
-ALIAS_INCH  = [_norm(x) for x in ["In chiamata","in_chiamata","tempo_in_chiamata","tempo_chiamata","durata_chiamata"]]
-ALIAS_PROC  = [_norm(x) for x in ["Processati","processato","record_processati","elaborati","processed","calls_processed"]]
-ALIAS_CALLS = [_norm(x) for x in [
-    "Nr. chiamate effettuate","nr chiamate effettuate","numero_chiamate",
-    "tot_chiamate","chiamate","calls","call_count","n_chiamate"
-]]
-ALIAS_RISP  = [_norm(x) for x in [
-    "Nr. chiamate con risposta","nr chiamate con risposta","risposte",
-    "answered","answered_calls","responses"
-]]
-ALIAS_POS   = [_norm(x) for x in ["Positivi","esiti_positivi","lead_positivi","ok","esito_positivo","positivi_tot"]]
-ALIAS_POSC  = [_norm(x) for x in [
-    "Positivi confermati","positivi_confermati","confermati","ok_confermati",
-    "positivi_ok","positivi_confirmed","confirmed"
-]]
+SCHEMA = None
+DB_TABLE = None
+DB_TABLE_RED = None
+DB_TABLE_CALLS = None
 
-# ================== DB-FREE LOADER HELPERS (come EDA) ==================
+# ================ EMBEDDED / CSV-ONLY LOADER HELPERS ================
+# This module will not use SQL. It will prefer app-injected tables (get_table / tables),
+# then dataset_embedded, then CSV files under ./data/.
+
 def _try_get_injected_table_names():
     try:
         gl_tables = globals().get("tables", None)
@@ -87,14 +62,6 @@ def _try_get_injected_table(name: str) -> Optional[pd.DataFrame]:
                 return df
     except Exception:
         pass
-    try:
-        gl_tables = globals().get("tables", None)
-        if isinstance(gl_tables, dict) and name in gl_tables:
-            df = gl_tables[name]
-            if isinstance(df, pd.DataFrame):
-                return df
-    except Exception:
-        pass
     return None
 
 def _try_dataset_embedded_names():
@@ -113,6 +80,7 @@ def _try_dataset_embedded_load(name: str) -> Optional[pd.DataFrame]:
         return None
 
 def _try_csv_load(name: str) -> Optional[pd.DataFrame]:
+    # try various common locations and separators
     p1 = Path(__file__).parent.resolve() / "data" / f"{name}.csv"
     p2 = Path.cwd() / "data" / f"{name}.csv"
     candidates = [p1, p2]
@@ -122,6 +90,7 @@ def _try_csv_load(name: str) -> Optional[pd.DataFrame]:
                 for sep in [';', ',', '\t', '|']:
                     try:
                         df = pd.read_csv(p, sep=sep, engine="python")
+                        # if looks reasonable, return
                         if df.shape[1] > 1 or df.shape[0] > 0:
                             return df
                     except Exception:
@@ -130,18 +99,28 @@ def _try_csv_load(name: str) -> Optional[pd.DataFrame]:
             continue
     return None
 
+# ================== DB-FREE REPLACEMENTS ==================
 @st.cache_data(ttl=60, show_spinner=False)
 def _current_db() -> str:
+    # No DB. Return fallback schema name.
     return FALLBACK_SCHEMA
 
 @st.cache_data(ttl=60, show_spinner=False)
 def _db_version(schema: str) -> str:
+    # Provide a simple version string based on current timestamp to mimic vkey behavior.
+    # This avoids SQL calls and still changes over time when files are updated (minute resolution).
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
 @st.cache_data(ttl=60, show_spinner=False)
-def _list_tables(schema: str) -> pd.DataFrame:
+def _list_tables(schema: str, vkey: str) -> pd.DataFrame:
+    """
+    Return available tables using (in order):
+      1) app-injected 'tables' dict
+      2) dataset_embedded module
+      3) CSV files in ./data
+    """
     rows = []
-    # injected dict
+    # 1) injected
     try:
         gl_tables = globals().get("tables", None)
         if isinstance(gl_tables, dict) and gl_tables:
@@ -155,7 +134,7 @@ def _list_tables(schema: str) -> pd.DataFrame:
     except Exception:
         pass
 
-    # dataset_embedded
+    # 2) dataset_embedded
     try:
         names = _try_dataset_embedded_names()
         for n in names:
@@ -165,7 +144,7 @@ def _list_tables(schema: str) -> pd.DataFrame:
     except Exception:
         pass
 
-    # CSV fallback
+    # 3) CSV in ./data
     try:
         data_dir = Path(__file__).parent.resolve() / "data"
         if data_dir.exists():
@@ -176,10 +155,19 @@ def _list_tables(schema: str) -> pd.DataFrame:
     except Exception:
         pass
 
-    return pd.DataFrame(columns=["table_name","table_type","table_rows"])
+    # fallback empty frame
+    return pd.DataFrame(columns=["table_name", "table_type", "table_rows"])
+
 
 @st.cache_data(ttl=60, show_spinner=False)
-def _load_table_sample(schema: str, table: str, limit: int = 0) -> pd.DataFrame:
+def _load_table_sample(schema: str, table: str, limit: int, vkey: str) -> pd.DataFrame:
+    """
+    Load table data using (in order):
+      1) injected get_table / get_table_norm
+      2) dataset_embedded.load_table
+      3) ./data/{table}.csv with common separators
+    Return a DataFrame (possibly empty).
+    """
     # 1) injected
     try:
         df = _try_get_injected_table(table)
@@ -187,6 +175,7 @@ def _load_table_sample(schema: str, table: str, limit: int = 0) -> pd.DataFrame:
             return df.head(limit) if limit and limit > 0 else df
     except Exception:
         pass
+
     # 2) dataset_embedded
     try:
         df = _try_dataset_embedded_load(table)
@@ -194,460 +183,477 @@ def _load_table_sample(schema: str, table: str, limit: int = 0) -> pd.DataFrame:
             return df.head(limit) if limit and limit > 0 else df
     except Exception:
         pass
-    # 3) csv
+
+    # 3) CSV fallback
     try:
         df = _try_csv_load(table)
         if isinstance(df, pd.DataFrame):
             return df.head(limit) if limit and limit > 0 else df
     except Exception:
         pass
+
     return pd.DataFrame()
 
-# ====== UTILS ======
-def _norm_cols(df: pd.DataFrame) -> dict:
-    return {_norm(c): c for c in df.columns}
-
-def _find_col(df: pd.DataFrame, aliases_norm: List[str]) -> Optional[str]:
-    if df is None or df.empty: return None
-    cmap = _norm_cols(df)
-    for a in aliases_norm:
-        if a in cmap: return cmap[a]
-    for a in aliases_norm:
-        for k, orig in cmap.items():
-            if a in k: return orig
+# ================== UTIL ==================
+def _find_col(df: pd.DataFrame, aliases: List[str]) -> Optional[str]:
+    cols = set(df.columns)
+    for a in aliases:
+        if a in cols: return a
+    lower_map = {c.lower(): c for c in df.columns}
+    for a in aliases:
+        if a.lower() in lower_map: return lower_map[a.lower()]
     return None
-
-# ---- Parser date deterministico (evita flip mese/giorno)
-def _to_datetime_fast(s: pd.Series) -> pd.Series:
-    if pd.api.types.is_datetime64_any_dtype(s):
-        return s
-
-    sv = s.astype(str).str.strip().replace({
-        "0000-00-00": None, "0000-00-00 00:00:00": None,
-        "": None, "None": None, "nan": None, "NaT": None,
-    })
-
-    slash = sv.str.match(r"^\d{1,2}/\d{1,2}/\d{4}(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?$", na=False)
-    dash  = sv.str.match(r"^\d{4}-\d{2}-\d{2}(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?$", na=False)
-
-    out = pd.Series(pd.NaT, index=sv.index, dtype="datetime64[ns]")
-
-    if slash.any():
-        out.loc[slash] = pd.to_datetime(sv.loc[slash], dayfirst=True, errors="coerce")
-    if dash.any():
-        out.loc[dash] = pd.to_datetime(sv.loc[dash], dayfirst=False, errors="coerce")
-
-    other = ~(slash | dash)
-    if other.any():
-        tmp = pd.to_datetime(sv.loc[other], errors="coerce", utc=False)
-        out.loc[other] = tmp
-
-    return out
 
 def _to_numeric_fast(s: pd.Series) -> pd.Series:
     if pd.api.types.is_numeric_dtype(s): return s
-    return pd.to_numeric(
-        s.astype(str).str.replace(".", "", regex=False)
-                     .str.replace(",", ".", regex=False)
-                     .str.replace(" ", "", regex=False),
-        errors="coerce",
+    if s.dtype == object:
+        return pd.to_numeric(
+            s.astype(str).str.replace(".", "", regex=False)
+                         .str.replace(",", ".", regex=False)
+                         .str.replace(" ", "", regex=False),
+            errors="coerce",
+        )
+    return pd.to_numeric(s, errors="coerce")
+
+def _to_datetime_fast(s: pd.Series) -> pd.Series:
+    if pd.api.types.is_datetime64_any_dtype(s): return s
+    if s.dtype == object:
+        sv = s.replace({"0000-00-00": None, "0000-00-00 00:00:00": None, "": None})
+        return pd.to_datetime(sv, errors="coerce", utc=False)
+    return pd.to_datetime(s, errors="coerce", utc=False)
+
+def _coerce_numeric_like(df: pd.DataFrame) -> pd.DataFrame:
+    out = {}
+    for c in df.columns:
+        s = df[c]
+        if pd.api.types.is_numeric_dtype(s):
+            out[c] = s
+        elif s.dtype == object:
+            ss = _to_numeric_fast(s)
+            if ss.notna().sum() >= MIN_VALID_FOR_COL:
+                out[c] = ss
+    return pd.DataFrame(out) if out else pd.DataFrame()
+
+def _datetime_columns(df: pd.DataFrame) -> List[str]:
+    cols = []
+    for c in df.columns:
+        s = df[c]
+        if pd.api.types.is_datetime64_any_dtype(s):
+            if s.notna().sum() >= MIN_DATE_VALID: cols.append(c)
+        elif s.dtype == object:
+            s2 = _to_datetime_fast(s)
+            if s2.notna().sum() >= MIN_DATE_VALID: cols.append(c)
+    return cols
+
+def _entropy(series: pd.Series, bins: int = 30) -> float:
+    s = pd.to_numeric(series, errors="coerce").dropna().values
+    if s.size == 0: return np.nan
+    counts, _ = np.histogram(s, bins=bins)
+    p = counts.astype(float); p = p[p>0]; p = p/p.sum()
+    return float(-(p*np.log2(p)).sum())
+
+def advanced_numeric_profile(df: pd.DataFrame) -> pd.DataFrame:
+    cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    rows = []
+    for c in cols:
+        s = pd.to_numeric(df[c], errors="coerce")
+        x = s.dropna().to_numpy(dtype=float)
+        n, k = int(len(s)), int(x.size)
+        if k == 0:
+            rows.append({"colonna":c,"count":n,"valid":0,"missing_%":100.0,"unique":0,
+                         "mean":np.nan,"median":np.nan,"std":np.nan,"var":np.nan,
+                         "min":np.nan,"q25":np.nan,"q50":np.nan,"q75":np.nan,"max":np.nan,
+                         "zeros_%":np.nan,"entropy_bits":np.nan})
+            continue
+        q25, q50, q75 = np.percentile(x, [25,50,75])
+        rows.append({"colonna":c,"count":n,"valid":k,"missing_%":float((n-k)/max(n,1)*100),
+                     "unique":int(s.nunique(dropna=True)),
+                     "mean":float(np.mean(x)),"median":float(np.median(x)),
+                     "std":float(np.std(x, ddof=1)) if k>1 else np.nan,
+                     "var":float(np.var(x, ddof=1)) if k>1 else np.nan,
+                     "min":float(np.min(x)),"q25":float(q25),"q50":float(q50),"q75":float(q75),"max":float(np.max(x)),
+                     "zeros_%":float((s==0).mean()*100),"entropy_bits":np.nan})
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        order = ["colonna","count","valid","missing_%","unique","mean","median","std","var","min","q25","q50","q75","max","zeros_%","entropy_bits"]
+        out = out[order].sort_values("colonna").reset_index(drop=True)
+    return out
+
+def _wrap_label(s: str, width: int = LABEL_WRAP) -> str:
+    s = str(s).strip()
+    if len(s)<=width: return s
+    parts, line = [], ""
+    for t in re.split(r"([_\-/\.\|\s])", s):
+        if len(line+t)>width and line:
+            parts.append(line.rstrip()); line = t.lstrip()
+        else:
+            line += t
+    if line: parts.append(line)
+    return "<br>".join(parts)
+
+def corr_heatmap_full(df_in: pd.DataFrame) -> go.Figure:
+    if df_in is None or df_in.empty: return go.Figure()
+    num = _coerce_numeric_like(df_in)
+    if num.empty or num.shape[1]==0: return go.Figure()
+    keep = []
+    for c in num.columns:
+        s = pd.to_numeric(num[c], errors="coerce")
+        if s.notna().sum() >= MIN_VALID_FOR_COL:
+            keep.append(c)
+    num = num[keep]
+    if num.shape[1]==0: return go.Figure()
+    corr = num.corr(method="pearson", min_periods=MIN_VALID_FOR_COL)
+    xs = list(corr.columns); ys = list(corr.index)
+    xt = [_wrap_label(x, LABEL_WRAP) for x in xs]
+    yt = [_wrap_label(y, LABEL_WRAP) for y in ys]
+    hm = go.Heatmap(
+        z=corr.values, x=xs, y=ys, zmin=-1, zmax=1,
+        colorscale=[[0.0,"#B22222"],[0.35,"#FF8C00"],[0.5,"#FFD700"],[1.0,"#1E7E34"]],
+        xgap=2, ygap=2,
+        colorbar=dict(tickvals=[-1,-0.5,0,0.5,1], len=0.6, thickness=14),
+        hovertemplate="x: %{x}<br>y: %{y}<br>r: %{z:.3f}<extra></extra>"
     )
+    fig = go.Figure([hm])
+    fig.update_layout(template="plotly_dark", paper_bgcolor=DARK_BG, plot_bgcolor=DARK_BG,
+                      height=max(560, len(corr)*26), margin=dict(t=60,l=120,r=120,b=120))
+    fig.update_xaxes(ticktext=xt, tickvals=xs)
+    fig.update_yaxes(ticktext=yt, tickvals=ys, autorange="reversed")
+    return fig
 
-def _to_hours(s: pd.Series) -> pd.Series:
-    if s.dtype == object and s.astype(str).str.contains(":").any():
-        td = pd.to_timedelta(s.astype(str), errors="coerce")
-        return td.dt.total_seconds() / 3600.0
-    num = _to_numeric_fast(s)
-    vals = num.dropna()
-    if not vals.empty and (vals.mod(1) == 0).mean() > 0.95 and (vals.median() > 59):
-        return num / 60.0
-    return num
+def _kde_numpy(values: np.ndarray, grid: np.ndarray) -> np.ndarray:
+    vals = values[~np.isnan(values)]; n = vals.size
+    if n==0: return np.zeros_like(grid)
+    std = np.std(vals, ddof=1) if n>1 else 0.0
+    h = 1.06 * std * n ** (-1/5) if std>0 else 0.1
+    if h<=0: h=0.1
+    diff = (grid[:,None] - vals[None,:]) / h
+    kern = np.exp(-0.5 * diff**2) / np.sqrt(2*np.pi)
+    return kern.sum(axis=1) / (n*h)
 
-def show_df(df: pd.DataFrame, height: int | None = None):
-    _df = df if df is not None else pd.DataFrame()
-    n = len(_df)
-    h = min(60 + 28 * max(1, min(n, 250)), 700)
-    st.dataframe(_df, use_container_width=True, height=height or h)
+def distribution_figure(series: pd.Series, name: str) -> go.Figure:
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    if s.empty: return go.Figure()
+    x = s.to_numpy(dtype=float); mn, mx = float(np.min(x)), float(np.max(x))
+    if np.isclose(mn, mx): mn, mx = mn-0.5, mx+0.5
+    grid = np.linspace(mn, mx, 400); kde = _kde_numpy(x, grid)
+    counts, edges = np.histogram(x, bins=HIST_BINS)
+    centers = (edges[:-1]+edges[1:])/2
+    widths = (edges[1:] - edges[:-1])
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=centers, y=counts, width=widths, name="Istogramma", marker=dict(line=dict(width=0))))
+    y2 = kde/kde.max()*counts.max() if kde.max()>0 else kde
+    fig.add_trace(go.Scatter(x=grid, y=y2, mode="lines", name="KDE", line=dict(width=2)))
+    fig.update_layout(template="plotly_dark", paper_bgcolor=DARK_BG, plot_bgcolor=DARK_BG,
+                      height=360, legend=dict(orientation="h"),
+                      margin=dict(t=40,l=60,r=40,b=50))
+    fig.update_xaxes(title=name); fig.update_yaxes(title="Conteggio")
+    return fig
 
-def _chart_key(op: str, metric: str, postfix: str = "") -> str:
-    slug = re.sub(r"[^a-z0-9]+", "-", str(op).lower()).strip("-")
-    if postfix:
-        slug = f"{slug}-{postfix}"
-    return f"opr-{slug}-{metric}"
-
-def _is_valid_month(m: str) -> bool:
-    try:
-        pd.Period(str(m), freq="M"); return True
-    except Exception:
-        return False
-
-# ====== FILTRI (mesi, attività) ======
+# ================== GLOBAL FILTER OPTIONS ==================
 @st.cache_data(ttl=60, show_spinner=False)
-def _collect_filter_options(schema_now: str):
-    mesi, att, op = set(), set(), set()
-    tbls = _list_tables(schema_now)
+def _collect_global_filter_options(schema_now: str, vkey: str):
+    mesi_set, att_set, op_set = set(), set(), set()
+    tbls = _list_tables(schema_now, vkey)
     for _, r in tbls.iterrows():
-        df = _load_table_sample(schema_now, r["table_name"], ROW_LIMIT_PER_TABLE)
+        tname = r["table_name"]
+        df = _load_table_sample(schema_now, tname, ROW_LIMIT_PER_TABLE, vkey)
         if df.empty: continue
         dcol = _find_col(df, ALIAS_DATA)
         if dcol:
             dt = _to_datetime_fast(df[dcol])
             if dt.notna().any():
-                mesi.update(dt.dt.to_period("M").astype(str).unique().tolist())
+                mesi_set.update(dt.dt.to_period("M").astype(str).dropna().unique().tolist())
         acol = _find_col(df, ALIAS_ATT)
-        if acol: att.update(df[acol].dropna().astype(str).unique().tolist())
+        if acol:
+            att_set.update(df[acol].dropna().astype(str).unique().tolist())
         ocol = _find_col(df, ALIAS_OP)
-        if ocol: op.update(df[ocol].dropna().astype(str).unique().tolist())
-    return sorted([m for m in mesi if _is_valid_month(m)]), sorted(att), sorted(op)
+        if ocol:
+            op_set.update(df[ocol].dropna().astype(str).unique().tolist())
+    return sorted(mesi_set), sorted(att_set), sorted(op_set)
 
-# ====== AGGREGAZIONE MENSILE PER OPERATORE E ATTIVITÀ ======
-@st.cache_data(ttl=60, show_spinner=False)
-def _monthly_by_operator(schema_now: str,
-                         mesi_sel: List[str], att_sel: List[str]) -> pd.DataFrame:
-    rows = []
-    tbls = _list_tables(schema_now)
-    for _, r in tbls.iterrows():
-        df = _load_table_sample(schema_now, r["table_name"], ROW_LIMIT_PER_TABLE)
-        if df.empty: continue
+# ================== UI HELPERS ==================
+def _auto_height(df: pd.DataFrame, row_px=28, base_px=60, max_px=700) -> int:
+    n = len(df) if df is not None else 0
+    return min(base_px + row_px * max(1, min(n, 250)), max_px)
 
-        dcol = _find_col(df, ALIAS_DATA)
-        ocol = _find_col(df, ALIAS_OP)
-        if not (dcol and ocol): continue
+def show_df(df: pd.DataFrame, height: int | None = None):
+    _df = df if df is not None else pd.DataFrame()
+    st.dataframe(_df, use_container_width=True, height=height or _auto_height(_df))
 
-        acol = _find_col(df, ALIAS_ATT)
-        lav  = _find_col(df, ALIAS_LAV)
-        conv = _find_col(df, ALIAS_CONV) or _find_col(df, ALIAS_INCH)
-        proc = _find_col(df, ALIAS_PROC)
-        calls= _find_col(df, ALIAS_CALLS)
-        risp = _find_col(df, ALIAS_RISP)
-        pos  = _find_col(df, ALIAS_POS)
-        posc = _find_col(df, ALIAS_POSC)
-        if not any([lav, conv, proc, calls, risp, pos, posc]): continue
-
-        dt = _to_datetime_fast(df[dcol])
-        month = dt.dt.to_period("M").astype(str)
-
-        mask = pd.Series(True, index=df.index)
-        if mesi_sel:
-            mask &= month.isin([m for m in mesi_sel if _is_valid_month(m)])
-        if att_sel and acol:
-            mask &= df[acol].astype(str).isin(att_sel)
-        if not mask.any(): continue
-
-        tmp = pd.DataFrame({
-            "mese": month[mask],
-            "operatore": df.loc[mask, ocol].astype(str),
-            "attivita": df.loc[mask, acol].astype(str) if acol else "N/D",
-            "lav_gen": _to_hours(df.loc[mask, lav]) if lav else 0.0,
-            "conversazione": _to_hours(df.loc[mask, conv]) if conv else 0.0,
-            "processati": _to_numeric_fast(df.loc[mask, proc]) if proc else 0.0,
-            "chiamate": _to_numeric_fast(df.loc[mask, calls]) if calls else 0.0,
-            "risposte": _to_numeric_fast(df.loc[mask, risp]) if risp else 0.0,
-            "positivi": _to_numeric_fast(df.loc[mask, pos]) if pos else 0.0,
-            "positivi_conf": _to_numeric_fast(df.loc[mask, posc]) if posc else 0.0,
-        })
-        tmp = tmp[tmp["mese"].apply(_is_valid_month)]
-        if not tmp.empty:
-            rows.append(tmp)
-
-    if not rows:
-        cols = ["mese","operatore","attivita","lav_gen","conversazione","processati","chiamate","risposte","positivi","positivi_conf",
-                "proc_per_pos","resa_h","caduti_pct","red_pct","risposta_pct","in_ch_pct"]
-        return pd.DataFrame(columns=cols)
-
-    df_all = pd.concat(rows, ignore_index=True)
-
-    # aggrego PER mese, operatore, attività
-    agg = (df_all.groupby(["mese","operatore","attivita"], as_index=False)
-           .sum(numeric_only=True))
-
-    # assicurati tipi numerici e gestione inf/nan
-    for c in ["positivi","processati","lav_gen","conversazione","chiamate","risposte","positivi_conf"]:
-        if c in agg.columns:
-            agg[c] = pd.to_numeric(agg[c], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
-
-    # derivate per riga (mese-operatore-attività)
-    pos   = agg["positivi"].to_numpy(float)
-    proc  = agg["processati"].to_numpy(float)
-    lav   = agg["lav_gen"].to_numpy(float)
-    calls = agg["chiamate"].to_numpy(float)
-
-    agg["proc_per_pos"] = np.where(pos > 0, proc / pos, 0.0)
-    agg["resa_h"]       = np.where(lav > 0,  agg["positivi"] / lav, 0.0)
-    agg["caduti_pct"]   = np.where(pos > 0, (agg["positivi"] - agg["positivi_conf"]) / pos * 100.0, 0.0)
-    agg["red_pct"]      = np.where(proc > 0, agg["positivi"] / proc * 100.0, 0.0)
-    agg["risposta_pct"] = np.where(calls > 0, agg["risposte"] / calls * 100.0, 0.0)
-    agg["in_ch_pct"]    = np.where(lav > 0,  agg["conversazione"] / lav * 100.0, 0.0)
-
-    # clamp percentuali tra 0 e 100 per robustezza
-    for pct in ["caduti_pct","red_pct","risposta_pct","in_ch_pct"]:
-        if pct in agg.columns:
-            agg[pct] = pd.to_numeric(agg[pct], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
-            agg[pct] = agg[pct].clip(lower=0.0, upper=100.0)
-
+def go_home():
+    st.session_state["page"] = "home"
     try:
-        agg["_ord"] = pd.to_datetime(agg["mese"] + "-01", errors="coerce")
-        agg = agg.sort_values(["operatore","attivita","_ord"]).drop(columns="_ord")
+        st.rerun()
     except Exception:
-        agg = agg.sort_values(["operatore","attivita","mese"])
-
-    return agg.reset_index(drop=True)
-
-# ====== SERIE ======
-def _series_operator_activity(dfm: pd.DataFrame, operatore: str, activity: str, metric: str) -> pd.Series:
-    """Serie per un operatore e una specifica attività (1 barra per attività)."""
-    if dfm.empty: return pd.Series(dtype=float)
-    sub = dfm[(dfm["operatore"] == operatore) & (dfm["attivita"] == activity)]
-    s = sub.groupby("mese")[metric].sum(numeric_only=True)
-    s = s[pd.to_datetime(s.index + "-01", errors="coerce").notna()]
-    s.index = pd.to_datetime(s.index + "-01").to_period("M").astype(str)
-    return s
-
-def _series_operator_total_filtered(dfm: pd.DataFrame, operatore: str, activities: List[str], metric: str) -> pd.Series:
-    """Serie aggregata per confronto: operatore ma solo sulle attività scelte."""
-    if dfm.empty: return pd.Series(dtype=float)
-    sub = dfm[(dfm["operatore"] == operatore)]
-    if activities:
-        sub = sub[sub["attivita"].isin(activities)]
-    s = sub.groupby("mese")[metric].sum(numeric_only=True)
-    s = s[pd.to_datetime(s.index + "-01", errors="coerce").notna()]
-    s.index = pd.to_datetime(s.index + "-01").to_period("M").astype(str)
-    return s
-
-def _series_team_mean_filtered(dfm: pd.DataFrame, activities: List[str], metric: str) -> pd.Series:
-    """Media team sulle sole attività selezionate."""
-    if dfm.empty: return pd.Series(dtype=float)
-    sub = dfm if not activities else dfm[dfm["attivita"].isin(activities)]
-    s = sub.groupby("mese")[metric].mean(numeric_only=True)
-    s = s[pd.to_datetime(s.index + "-01", errors="coerce").notna()]
-    s.index = pd.to_datetime(s.index + "-01").to_period("M").astype(str)
-    return s
-
-# ====== BARRE MULTI-BASE (una barra per ciascuna attività selezionata) + TREND COMBINATO ======
-def _bar_multi_base_compare(
-    base_series: List[Tuple[str, pd.Series, str]],  # [(label_base, series, color), ...] una per attività
-    comps: List[Tuple[str, pd.Series, str]],        # confronti (altri operatori / Media Team)
-    title: str,
-    y_title: str,
-    trend_label: str,
-    trend_color: str = ORANGE,
-) -> go.Figure:
-    def _norm_s(s: pd.Series) -> pd.Series:
-        s = pd.to_numeric(s, errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
-        s = s.copy()
-        s.index = pd.to_datetime(pd.Index(s.index).astype(str) + "-01", errors="coerce") \
-                    .to_period("M").astype(str)
-        s = s.groupby(level=0).sum()
-        return s
-
-    base_series = [(lab, _norm_s(s), col) for lab, s, col in base_series]
-    comps = [(name, _norm_s(s), col) for name, s, col in comps]
-
-    months = sorted(set([m for _, s, _ in base_series for m in s.index.tolist()] +
-                        [m for _, s, _ in comps for m in s.index.tolist()]))
-
-    fig = go.Figure()
-    # Barre base: una per ogni attività selezionata
-    for lab, s, col in base_series:
-        fig.add_bar(name=lab, x=months, y=[float(s.get(m, 0.0)) for m in months],
-                    marker_color=col, showlegend=True)
-
-    # Barre confronto (aggregati su att_sel)
-    for name, s, col in comps:
-        fig.add_bar(name=name, x=months, y=[float(s.get(m, 0.0)) for m in months],
-                    marker_color=col, showlegend=True)
-
-    # Trend (linea) calcolato sulla somma delle attività base (per non sporcare con troppe linee)
-    if base_series and months:
         try:
-            y_sum = np.zeros(len(months), dtype=float)
-            for _, s, _ in base_series:
-                y_sum += np.array([float(s.get(m, 0.0)) for m in months], dtype=float)
-            if len(months) >= 2 and not np.allclose(y_sum, 0):
-                xdt = pd.to_datetime([m + "-01" for m in months], errors="coerce")
-                xnum = xdt.map(pd.Timestamp.toordinal).to_numpy(dtype=float)
-                a, b = np.polyfit(xnum, y_sum, 1)
-                y0, y1 = a*xnum.min() + b, a*xnum.max() + b
-                fig.add_trace(go.Scatter(
-                    x=[months[0], months[-1]],
-                    y=[y0, y1],
-                    mode="lines+markers",
-                    line=dict(width=3, color=trend_color),
-                    marker=dict(size=6, color=trend_color),
-                    name=f"Trend {trend_label}",
-                    showlegend=True,
-                ))
+            st.experimental_rerun()
         except Exception:
             pass
 
-    fig.update_xaxes(type="category", categoryorder="array", categoryarray=months)
-    fig.update_layout(
-        title=dict(text=title, pad=dict(t=6)),
-        template="plotly_dark",
-        paper_bgcolor=DARK_BG, plot_bgcolor=DARK_BG,
-        height=420, xaxis_title="", yaxis_title=y_title,
-        margin=dict(t=60, l=60, r=60, b=80),
-        barmode="group",
-        showlegend=True,
-    )
-    return fig
+def _fig_to_html(fig: go.Figure) -> str:
+    return fig.to_html(full_html=False, include_plotlyjs="cdn")
 
-def _fig_html(fig: go.Figure) -> str:
-    return fig.to_html(full_html=False, include_plotlyjs="cdn", config={"displaylogo": False})
+# ================== REPORT (HTML) ==================
+def _build_printable_report(schema_now: str, vkey: str) -> str:
+    head = f"""
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<title>EDA Report</title>
+<link rel="preconnect" href="https://cdn.plot.ly"/>
+<style>
+  body {{ font-family: Arial, sans-serif; color:#111; }}
+  h1,h2,h3 {{ margin: 8px 0; }}
+  .section {{ page-break-inside: avoid; margin: 18px 0; }}
+  table {{ border-collapse: collapse; width:100%; font-size:12px; }}
+  th,td {{ border:1px solid #ddd; padding:6px; }}
+  .muted {{ color:#444; }}
+</style>
+</head>
+<body>
+<h1>EDA Report</h1>
+<p class="muted">Schema: <b>{schema_now}</b> | vkey: {vkey}</p>
+"""
+    body = []
 
-# ====== PAGINA ======
+    tbls = _list_tables(schema_now, vkey)
+    body.append("<div class='section'><h2>Tabelle nello schema</h2>")
+    body.append(tbls[["table_name","table_type","table_rows"]].to_html(index=False))
+    body.append("</div>")
+
+    for _, r in tbls.iterrows():
+        tname = r["table_name"]
+        df = _load_table_sample(schema_now, tname, ROW_LIMIT_PER_TABLE, vkey)
+
+        body.append(f"<div class='section'><h2>Tabella: {schema_now}.{tname}</h2>")
+        body.append(f"<p class='muted'>Righe: {len(df)} | Colonne: {len(df.columns)}</p>")
+
+        if df.empty:
+            body.append("<p>Tabella vuota o non leggibile.</p></div>")
+            continue
+
+        body.append("<h3>Anteprima</h3>")
+        body.append(df.head(200).to_html(index=False))
+
+        miss = pd.DataFrame({
+            "colonna": df.columns,
+            "missing": [int(df[c].isna().sum()) for c in df.columns],
+            "missing_%": [float(df[c].isna().mean()*100) for c in df.columns],
+            "unique": [int(df[c].nunique(dropna=True)) for c in df.columns],
+        }).sort_values("missing_%", ascending=False).reset_index(drop=True)
+        body.append("<h3>Missing per colonna</h3>")
+        body.append(miss.to_html(index=False))
+
+        adv = advanced_numeric_profile(df)
+        if not adv.empty:
+            body.append("<h3>Statistiche avanzate (numeriche)</h3>")
+            body.append(adv.to_html(index=False))
+
+        figc = corr_heatmap_full(df)
+        if len(figc.data) > 0:
+            body.append("<h3>Matrice di correlazione (Pearson)</h3>")
+            body.append(_fig_to_html(figc))
+
+        num_all = _coerce_numeric_like(df)
+        if not num_all.empty:
+            body.append("<h3>Distribuzioni</h3>")
+            for col in list(num_all.columns):
+                figd = distribution_figure(num_all[col], col)
+                if len(figd.data) > 0:
+                    body.append(f"<h4>{col}</h4>")
+                    body.append(_fig_to_html(figd))
+
+        dcols = _datetime_columns(df)
+        if dcols:
+            dcol = dcols[0]
+            dt = _to_datetime_fast(df[dcol]); mask = dt.notna()
+            if mask.sum() >= MIN_DATE_VALID:
+                tmp = df.loc[mask].copy()
+                tmp["_wd"] = dt[mask].dt.weekday
+                tmp["_lbl"] = tmp["_wd"].map({0:"LUN",1:"MAR",2:"MER",3:"GIO",4:"VEN",5:"SAB",6:"DOM"})
+                counts = (tmp["_lbl"].value_counts()
+                          .reindex(["LUN","MAR","MER","GIO","VEN","SAB","DOM"], fill_value=0)
+                          .rename_axis("Giorno").reset_index(name="Conteggio"))
+                body.append("<h3>Pattern giornalieri</h3>")
+                body.append(counts.to_html(index=False))
+                if not num_all.empty:
+                    means = (pd.concat([tmp[["_lbl"]], num_all.loc[tmp.index]], axis=1)
+                             .groupby("_lbl").mean(numeric_only=True)
+                             .reindex(["LUN","MAR","MER","GIO","VEN","SAB","DOM"]))
+                    body.append(means.rename_axis("Giorno").reset_index().to_html(index=False))
+        body.append("</div>")
+
+    tail = "</body></html>"
+    return head + "\n".join(body) + tail
+
+# ================== PAGE ==================
 def render() -> None:
     try:
         from streamlit_autorefresh import st_autorefresh
-        st_autorefresh(interval=60_000, key="opr_autorefresh")
+        st_autorefresh(interval=60_000, key="eda_autorefresh")
     except Exception:
         pass
 
-    st.title("Scheda Operatore")
     schema_now = _current_db()
     vkey = f"{_db_version(schema_now)}|{int(time.time()//60)}"
+
+    st.title("EDA - Explorative Data Analysis")
     st.caption(f"Schema attivo: {schema_now}  |  vkey: {vkey}")
 
-    mesi_opts, att_opts, _ = _collect_filter_options(schema_now)
-    c1, c2 = st.columns(2)
+    mesi_opts, att_opts, op_opts = _collect_global_filter_options(schema_now, vkey)
+
+    c1, c2, c3 = st.columns(3)
     with c1:
-        mesi_sel = st.multiselect("Mese (YYYY-MM)", mesi_opts, default=[], key="opr_mesi")
+        mesi_sel = st.multiselect("Mese (YYYY-MM)", mesi_opts, default=[], key="f_mesi")
     with c2:
-        att_sel = st.multiselect("Attività", att_opts, default=[], key="opr_att")
+        att_sel = st.multiselect("Attività", att_opts, default=[], key="f_att")
+    with c3:
+        op_sel = st.multiselect("Operatore", op_opts, default=[], key="f_op")
 
-    dfm_all = _monthly_by_operator(schema_now, mesi_sel, att_sel)
-    if dfm_all.empty:
-        st.warning("Nessun dato mensile con i filtri correnti.")
-        _footer(schema_now, mesi_sel, att_sel, pd.DataFrame(), [])
-        return
+    tbls = _list_tables(schema_now, vkey)
+    st.caption(f"Tabelle nello schema `{schema_now}`: {len(tbls)}")
+    show_df(tbls[["table_name","table_type","table_rows"]], height=300)
 
-    operatori = sorted(dfm_all["operatore"].dropna().unique().tolist())
-    compare_options = ["Media Team"] + operatori
-    compare_sel = st.multiselect("Compara con (operatori / Media Team)", compare_options, default=[], key="opr_compare")
+    for _, r in tbls.iterrows():
+        tname = r["table_name"]
+        with st.expander(f"Tabella: {schema_now}.{tname}", expanded=False):
+            df = _load_table_sample(schema_now, tname, ROW_LIMIT_PER_TABLE, vkey)
+            if df.empty:
+                st.warning("Tabella vuota o non leggibile.")
+                continue
 
-    tabs = st.tabs(operatori)
+            dcol = _find_col(df, ALIAS_DATA)
+            acol = _find_col(df, ALIAS_ATT)
+            ocol = _find_col(df, ALIAS_OP)
 
-    COLORS = {
-        "lav_gen": FUXIA, "conversazione": GREEN, "chiamate": BLUE, "processati": TEAL,
-        "proc_per_pos": "#22c55e", "resa_h": "#10b981", "positivi_conf": ORANGE,
-        "caduti_pct": CADUTI, "red_pct": "#0ea5e9", "risposta_pct": "#f59e0b", "in_ch_pct": YELLOW,
-    }
-    metrics = [
-        ("lav_gen", "Lavorazione generale", "Ore"),
-        ("conversazione", "Conversazione", "Ore"),
-        ("chiamate", "Nr. chiamate", "Chiamate"),
-        ("proc_per_pos", "Processati per positivo", "x"),
-        ("resa_h", "Resa/h (positivi / lav. gen.)", "Positivi/ora"),
-        ("positivi_conf", "App confermati", "Numero"),
-        ("caduti_pct", "% caduti", "%"),
-        ("red_pct", "RED% mensile", "%"),
-        ("risposta_pct", "Risposta % (risposte/chiamate)", "%"),
-        ("in_ch_pct", "In Chiamata % (conv/lav_gen)", "%"),
-    ]
+            mask = pd.Series(True, index=df.index)
 
-    export_charts: List[Tuple[str, str]] = []
+            if mesi_sel and dcol:
+                dt = _to_datetime_fast(df[dcol])
+                if dt.notna().any():
+                    months = dt.dt.to_period("M").astype(str)
+                    mask &= months.isin(mesi_sel)
 
-    for tab, op in zip(tabs, operatori):
-        with tab:
-            st.subheader(op)
-            sub_tab = dfm_all[dfm_all["operatore"] == op].copy()
-            if mesi_sel: sub_tab = sub_tab[sub_tab["mese"].isin(mesi_sel)]
+            if att_sel and acol:
+                mask &= df[acol].astype(str).isin(att_sel)
 
-            # Attività effettivamente disponibili per questo operatore (post filtri)
-            avail_att = sorted(sub_tab["attivita"].dropna().unique().tolist())
-            att_display = [a for a in att_sel if a in avail_att] if att_sel else avail_att
+            if op_sel and ocol:
+                mask &= df[ocol].astype(str).isin(op_sel)
 
-            for (mcol, title, ylab) in metrics:
-                # Base: UNA SERIE PER OGNI ATTIVITÀ SELEZIONATA
-                base_series: List[Tuple[str, pd.Series, str]] = []
-                for idx, a in enumerate(att_display):
-                    s = _series_operator_activity(sub_tab, op, a, mcol)
-                    base_series.append((f"{op} — {a}", s, COMP_COLORS[idx % len(COMP_COLORS)]))
+            df = df.loc[mask].copy()
 
-                # Confronti: aggregazione sulle stesse attività selezionate (non per-att)
-                comp_series: List[Tuple[str, pd.Series, str]] = []
-                cidx = 0
-                for label in compare_sel:
-                    if label == "Media Team":
-                        s = _series_team_mean_filtered(dfm_all if not mesi_sel else dfm_all[dfm_all["mese"].isin(mesi_sel)],
-                                                       att_display, mcol)
-                        comp_series.append((label, s, "#a1a1aa"))
-                    elif label != op:
-                        s = _series_operator_total_filtered(dfm_all if not mesi_sel else dfm_all[dfm_all["mese"].isin(mesi_sel)],
-                                                            label, att_display, mcol)
-                        comp_series.append((label, s, COMP_COLORS[(len(att_display) + cidx) % len(COMP_COLORS)]))
-                        cidx += 1
+            rows_cnt, cols_cnt = len(df), len(df.columns)
+            num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+            dt_cols = _datetime_columns(df)
+            st.caption(
+                f"Righe: {rows_cnt:,} | Colonne: {cols_cnt} | Numeriche: {len(num_cols)} | Date: {len(dt_cols)}"
+                .replace(",", ".")
+            )
 
-                fig = _bar_multi_base_compare(
-                    base_series=base_series,
-                    comps=comp_series,
-                    title=title, y_title=ylab,
-                    trend_label=op,
-                )
-                st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False},
-                                key=_chart_key(op, mcol, "cmp"))
-                export_charts.append((f"{op} — {title}", _fig_html(fig)))
+            st.subheader("Anteprima"); show_df(df.head(200), height=360)
 
-            st.markdown("#### Tabella mensile (1 riga/mese, per attività)")
-            cols = ["mese","attivita","lav_gen","conversazione","chiamate","processati","positivi","positivi_conf",
-                    "proc_per_pos","resa_h","caduti_pct","red_pct","risposta_pct","in_ch_pct"]
-            tdf = (sub_tab[cols]
-                   .groupby(["mese","attivita"], as_index=False).sum(numeric_only=True)
-                   .sort_values(["mese","attivita"]))
-            show_df(tdf)
+            st.subheader("Missing per colonna")
+            miss = pd.DataFrame({
+                "colonna": df.columns,
+                "missing": [int(df[c].isna().sum()) for c in df.columns],
+                "missing_%": [float(df[c].isna().mean()*100) for c in df.columns],
+                "unique": [int(df[c].nunique(dropna=True)) for c in df.columns],
+            }).sort_values("missing_%", ascending=False).reset_index(drop=True)
+            show_df(miss)
 
-    _footer(schema_now, mesi_sel, att_sel, dfm_all, export_charts)
+            st.subheader("Statistiche avanzate (numeriche)")
+            adv = advanced_numeric_profile(df)
+            if adv.empty: st.info("Nessuna colonna numerica nativa.")
+            else: show_df(adv)
 
-# ====== FOOTER + EXPORT ======
-def _footer(schema_now: str, mesi_sel: List[str], att_sel: List[str],
-            dfm: pd.DataFrame, charts: List[Tuple[str,str]]):
+            st.subheader("Frequenze categoriali top-10")
+            cats = [c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c]) and not pd.api.types.is_datetime64_any_dtype(df[c])]
+            if cats:
+                for c in cats:
+                    with st.expander(c, expanded=False):
+                        s = df[c].astype(str)
+                        top = s.value_counts(dropna=False).head(10).reset_index()
+                        top.columns = [c, "count"]; top["pct"] = top["count"]/max(len(s),1)*100
+                        show_df(top)
+            else:
+                st.caption("Nessuna categorica testuale rilevata.")
+
+            st.subheader("Matrice di correlazione completa")
+            figc = corr_heatmap_full(df)
+            if len(figc.data)==0: st.caption("Correlazioni: non applicabile.")
+            else: st.plotly_chart(figc, use_container_width=True, config={"displaylogo": False})
+
+            num_all = _coerce_numeric_like(df)
+            if not num_all.empty:
+                st.subheader("Distribuzioni (Istogramma + KDE)")
+                for col in list(num_all.columns):
+                    with st.expander(f"Distribuzione: {col}", expanded=False):
+                        figd = distribution_figure(num_all[col], col)
+                        if len(figd.data)==0: st.caption("Nessun dato valido.")
+                        else: st.plotly_chart(figd, use_container_width=True, config={"displaylogo": False})
+
+            if dcol:
+                st.subheader("Pattern giornalieri")
+                dt = _to_datetime_fast(df[dcol]); mask_dt = dt.notna()
+                if mask_dt.sum() >= MIN_DATE_VALID:
+                    tmp = df.loc[mask_dt].copy()
+                    tmp["_wd"] = dt[mask_dt].dt.weekday
+                    tmp["_lbl"] = tmp["_wd"].map({0:"LUN",1:"MAR",2:"MER",3:"GIO",4:"VEN",5:"SAB",6:"DOM"})
+                    counts = (tmp["_lbl"].value_counts()
+                              .reindex(["LUN","MAR","MER","GIO","VEN","SAB","DOM"], fill_value=0)
+                              .rename_axis("Giorno").reset_index(name="Conteggio"))
+                    show_df(counts)
+                    if not num_all.empty:
+                        means = (pd.concat([tmp[["_lbl"]], num_all.loc[tmp.index]], axis=1)
+                                 .groupby("_lbl").mean(numeric_only=True)
+                                 .reindex(["LUN","MAR","MER","GIO","VEN","SAB","DOM"]))
+                        show_df(means.rename_axis("Giorno").reset_index())
+                else:
+                    st.caption("Date insufficienti per analisi.")
+            else:
+                st.caption("Nessuna colonna data rilevata.")
+
+    st.markdown("---")
+
+    schema_now = _current_db()
+    vkey_now = f"{_db_version(schema_now)}|{int(time.time()//60)}"
+    html_report = _build_printable_report(schema_now, vkey_now)
+    buf = io.BytesIO(html_report.encode("utf-8"))
+
     st.markdown("""
     <style>
       div[data-testid="stDownloadButton"] > button,
       div[data-testid="stButton"] > button {
-        background: #ff00ff !important; color: #0b0b0b !important;
-        border: none !important; border-radius: 18px !important;
-        padding: 22px 18px !important; font-size: 20px !important; font-weight: 600 !important;
-        width: 100% !important; height: 86px !important; box-shadow: none !important;
+        background: #ff00ff !important;
+        color: #0b0b0b !important;
+        border: none !important;
+        border-radius: 18px !important;
+        padding: 22px 18px !important;
+        font-size: 20px !important;
+        font-weight: 600 !important;
+        width: 100% !important;
+        height: 86px !important;
+        box-shadow: none !important;
       }
     </style>
     """, unsafe_allow_html=True)
-    st.divider()
-    cdl, ch = st.columns(2)
-    export_cols = ["operatore","attivita","mese","lav_gen","conversazione","processati","chiamate","risposte",
-                   "positivi","positivi_conf","proc_per_pos","resa_h","caduti_pct","red_pct","risposta_pct","in_ch_pct"]
-    dfe = dfm[export_cols] if not dfm.empty else pd.DataFrame(columns=export_cols)
-    html = _export_html(schema_now, {"mesi": mesi_sel, "attività": att_sel}, dfe, charts)
-    cdl.download_button("⬇️ Scarica HTML", data=io.BytesIO(html),
-                        file_name=f"scheda_operatore_{schema_now}_{int(time.time())}.html",
-                        mime="text/html", use_container_width=True, key="opr-download-html")
-    if ch.button("🏠 Home", use_container_width=True, key="opr-go-home"):
-        st.session_state["page"] = "home"; st.rerun()
 
-def _export_html(schema_now: str, filters: dict, df_detail: pd.DataFrame,
-                 charts: List[Tuple[str,str]]) -> bytes:
-    head = f"""<!DOCTYPE html><html><head><meta charset="utf-8"/>
-<title>Scheda Operatore</title>
-<style>
-body {{ font-family: Arial, sans-serif; color:#111; }}
-h1,h2,h3 {{ margin: 8px 0; }}
-.section {{ page-break-inside: avoid; margin: 18px 0; }}
-table {{ border-collapse: collapse; width:100%; font-size:12px; }}
-th,td {{ border:1px solid #ddd; padding:6px; }}
-.muted {{ color:#444; }}
-</style></head><body>
-<h1>Scheda Operatore</h1>
-<p class="muted">Schema: <b>{schema_now}</b></p>
-<p class="muted">Filtri: {filters}</p>
-<div class='section'><h2>Tabella aggregata</h2>
-{df_detail.to_html(index=False)}
-</div>
-"""
-    parts = [head]
-    for title, html_fig in charts:
-        parts.append(f"<div class='section'><h3>{title}</h3>{html_fig}</div>")
-    parts.append("</body></html>")
-    return "".join(parts).encode("utf-8")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.download_button(
+            "⬇️ Scarica HTML",
+            data=buf,
+            file_name=f"EDA_report_{schema_now}_{int(time.time())}.html",
+            mime="text/html",
+            key="scarica_html",
+            use_container_width=True,
+        )
+    with c2:
+        if st.button("🏠 Home", key="home_btn", use_container_width=True):
+            go_home()
 
 if __name__ == "__main__":
     render()
+
+
