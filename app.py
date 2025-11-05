@@ -1,6 +1,9 @@
+#!/usr/bin/env python3
 # app.py — Home + routing (con Attività TLK e Scheda Operatore)
 # Aggiornato: data loader integrato (CSV ';' preferred / dataset.py / dataset_embedded)
 # Includes automatic semicolon CSV fix and light normalization helpers.
+
+from __future__ import annotations
 
 import streamlit as st
 from pathlib import Path
@@ -9,16 +12,7 @@ import pandas as pd
 import sys
 import shutil
 import re
-
-# === importa le pagine (assumi che esistano) ===
-import eda
-import SDR
-import SDRML
-import SDRforecast
-import Stats
-import probability
-import atts
-import operatore  # <- nuova pagina Scheda Operatore
+import time
 
 st.set_page_config(page_title="AEDB", page_icon="📊", layout="wide")
 
@@ -62,22 +56,16 @@ st.markdown(
 )
 
 # ================ DATA LOADER =================
-# Behavior:
-# 1) prefer CSV ./data/ reading semicolon first (fix immediato)
-# 2) try dataset.py (if present)
-# 3) try dataset_embedded (last)
-# 4) fallback Desktop path r"C:\Users\HP\Desktop\DATABASE_TLK"
 PROJECT_DIR = Path(__file__).parent.resolve()
 DATA_DIR = PROJECT_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
 DESKTOP_CSV_DIR = Path(r"C:\Users\HP\Desktop\DATABASE_TLK")
 
-tables = {}  # original, fixed tables
-_norm_cache = {}  # normalized copies (lazy)
+tables: dict[str, pd.DataFrame] = {}  # original, fixed tables
+_norm_cache: dict[str, pd.DataFrame] = {}  # normalized copies (lazy)
 
 def _fix_semicolon_single_column(df: pd.DataFrame) -> pd.DataFrame:
-    """If df has a single column containing semicolon-separated values, split it."""
     if df.shape[1] != 1:
         return df
     s = df.iloc[:, 0].astype(str).fillna('')
@@ -94,7 +82,6 @@ def _fix_semicolon_single_column(df: pd.DataFrame) -> pd.DataFrame:
     return parts
 
 def _clean_headers(df: pd.DataFrame) -> pd.DataFrame:
-    """Strip BOMs, whitespace, collapse multiple spaces in headers; keep case as-is."""
     new_cols = []
     for c in df.columns:
         c2 = str(c)
@@ -106,7 +93,6 @@ def _clean_headers(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def _clean_string_cells(df: pd.DataFrame) -> pd.DataFrame:
-    """Trim string cells and collapse multiple spaces; keep types otherwise."""
     for c in df.select_dtypes(include=['object']).columns:
         try:
             df[c] = df[c].astype(str).str.strip().replace({'^nan$': None, '^None$': None}, regex=True)
@@ -116,7 +102,6 @@ def _clean_string_cells(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def _ensure_mese_column(df: pd.DataFrame) -> pd.DataFrame:
-    """Try find a date-like column and create 'mese' in YYYY-MM format if possible."""
     candidates = [c for c in df.columns if re.search(r'data|date|mese|timestamp|giorno', c, flags=re.I)]
     for cand in candidates:
         try:
@@ -159,7 +144,7 @@ def _load_from_dataset_py():
     try:
         import dataset  # type: ignore
         try:
-            loaded = dataset.load_all_tables_from_embedded()
+            loaded = getattr(dataset, "load_all_tables_from_embedded", lambda: {})()
             if loaded:
                 for k, v in loaded.items():
                     tables[k] = _postprocess_table(v)
@@ -184,7 +169,6 @@ def _load_from_csv_folder(folder: Path):
         try:
             df = pd.read_csv(p)
         except Exception:
-            # try common separators
             try:
                 df = pd.read_csv(p, sep=';', engine='python')
             except Exception:
@@ -202,11 +186,9 @@ def _load_from_csv_folder_prefer_semicolon(folder: Path):
     for p in csvs:
         name = p.stem
         df_loaded = None
-        # try semicolon first
         for sep in [';', ',', '\t', '|']:
             try:
                 df_try = pd.read_csv(p, sep=sep, engine='python')
-                # heuristic: accept if more than 1 column OR non-empty
                 if df_try.shape[1] > 1 or df_try.shape[0] > 0:
                     df_loaded = df_try
                     break
@@ -220,6 +202,7 @@ def _load_from_csv_folder_prefer_semicolon(folder: Path):
 
 # Run loaders in order: prefer CSVs (semicolon) first
 loaded = False
+loader_source = "none"
 if _load_from_csv_folder_prefer_semicolon(PROJECT_DIR / "data"):
     loaded = True
     loader_source = "project data/ (./data) sep=';' preferred"
@@ -232,7 +215,6 @@ elif _load_from_dataset_embedded():
 elif _load_from_csv_folder(DESKTOP_CSV_DIR):
     loaded = True
     loader_source = f"desktop {DESKTOP_CSV_DIR}"
-    # copy desktop CSVs to project data/ for reproducibility
     try:
         for p in sorted(DESKTOP_CSV_DIR.glob("*.csv")):
             dst = DATA_DIR / p.name
@@ -240,8 +222,6 @@ elif _load_from_csv_folder(DESKTOP_CSV_DIR):
                 shutil.copy2(p, dst)
     except Exception:
         pass
-else:
-    loader_source = "none"
 
 # Helper: get original fixed table
 def get_table(name: str) -> pd.DataFrame:
@@ -256,15 +236,12 @@ def get_table_norm(name: str) -> pd.DataFrame:
     if name not in tables:
         raise KeyError(f"Table '{name}' not found. Available: {list(tables.keys())}")
     df = tables[name].copy()
-    # lowercase column names
     df.columns = [str(c).strip().lower() for c in df.columns]
-    # trim string cells
     for c in df.select_dtypes(include=['object']).columns:
         try:
             df[c] = df[c].astype(str).str.strip().replace({'^nan$': None}, regex=True)
         except Exception:
             pass
-    # ensure mese column
     if 'mese' not in df.columns:
         df = _ensure_mese_column(df)
     _norm_cache[name] = df
@@ -274,27 +251,48 @@ def get_table_norm(name: str) -> pd.DataFrame:
 st.session_state.setdefault("tables_available", list(tables.keys()))
 st.session_state.setdefault("data_loader_source", loader_source)
 
-# ================ Router =================
+# ================ Safe dynamic imports of pages =================
+def _safe_import(name: str):
+    try:
+        return importlib.import_module(name)
+    except Exception:
+        return None
+
+# Try import modules, but do not fail if absent.
+page_modules = {
+    "eda": _safe_import("eda"),
+    "sdr": _safe_import("SDR"),
+    "sdrml": _safe_import("SDRML"),
+    "sdrforecast": _safe_import("SDRforecast"),
+    "statistica": _safe_import("Stats"),
+    "probabilita": _safe_import("probability"),
+    "attivita": _safe_import("atts"),
+    "operatore": _safe_import("operatore"),
+}
+
+# ================ Router / UI helpers =================
 if "page" not in st.session_state:
     st.session_state.page = "home"
 
 def goto(p: str):
     st.session_state.page = p
-    st.rerun()
+    st.experimental_rerun()
 
 def page_frame(_title: str, body_fn):
-    body_fn()
+    try:
+        body_fn()
+    except Exception as e:
+        st.exception(e)
 
 # ================= Home =================
 def render_home():
     st.markdown('<div class="title-wrap"><div class="title">TLK</div></div>', unsafe_allow_html=True)
     st.markdown('<div class="home-spacer"></div>', unsafe_allow_html=True)
 
-    # --- debug/info row under title ---
     cols_info = st.columns([1,2,2,2])
     with cols_info[0]:
         st.markdown(f"**Schema attivo:** aedbdata")
-        st.write("")  # small gap
+        st.write("")
     with cols_info[1]:
         st.markdown(f"**Dataloader:** `{st.session_state.data_loader_source}`")
     with cols_info[2]:
@@ -328,71 +326,115 @@ def render_home():
 
 # ================= Switch =================
 p = st.session_state.page
+
 if p == "home":
     render_home()
+
 elif p == "eda":
-    try:
-        eda.tables = tables
-        eda.get_table = get_table
-        eda.get_table_norm = get_table_norm
-    except Exception:
-        pass
-    page_frame("Explorative Data Analysis", eda.render)
+    mod = page_modules.get("eda")
+    if mod:
+        try:
+            setattr(mod, "tables", tables)
+            setattr(mod, "get_table", get_table)
+            setattr(mod, "get_table_norm", get_table_norm)
+        except Exception:
+            pass
+        page_frame("Explorative Data Analysis", getattr(mod, "render", lambda: st.error("render() missing")))
+    else:
+        st.error("Modulo EDA non disponibile.")
+
 elif p == "sdr":
-    try:
-        SDR.tables = tables
-        SDR.get_table = get_table
-        SDR.get_table_norm = get_table_norm
-    except Exception:
-        pass
-    page_frame("SDR Team", SDR.render)
+    mod = page_modules.get("sdr")
+    if mod:
+        try:
+            setattr(mod, "tables", tables)
+            setattr(mod, "get_table", get_table)
+            setattr(mod, "get_table_norm", get_table_norm)
+        except Exception:
+            pass
+        page_frame("SDR Team", getattr(mod, "render", lambda: st.error("render() missing")))
+    else:
+        st.error("Modulo SDR non disponibile.")
+
 elif p == "sdrml":
-    try:
-        SDRML.tables = tables
-        SDRML.get_table = get_table
-        SDRML.get_table_norm = get_table_norm
-    except Exception:
-        pass
-    page_frame("SDR Insight ML", SDRML.render)
+    mod = page_modules.get("sdrml")
+    if mod:
+        try:
+            setattr(mod, "tables", tables)
+            setattr(mod, "get_table", get_table)
+            setattr(mod, "get_table_norm", get_table_norm)
+        except Exception:
+            pass
+        page_frame("SDR Insight ML", getattr(mod, "render", lambda: st.error("render() missing")))
+    else:
+        st.error("Modulo SDRML non disponibile.")
+
 elif p == "sdrforecast":
-    try:
-        SDRforecast.tables = tables
-        SDRforecast.get_table = get_table
-        SDRforecast.get_table_norm = get_table_norm
-    except Exception:
-        pass
-    page_frame("SDR Forecast", SDRforecast.render)
+    mod = page_modules.get("sdrforecast")
+    if mod:
+        try:
+            setattr(mod, "tables", tables)
+            setattr(mod, "get_table", get_table)
+            setattr(mod, "get_table_norm", get_table_norm)
+        except Exception:
+            pass
+        page_frame("SDR Forecast", getattr(mod, "render", lambda: st.error("render() missing")))
+    else:
+        st.error("Modulo SDRforecast non disponibile.")
+
 elif p == "statistica":
-    try:
-        Stats.tables = tables
-        Stats.get_table = get_table
-        Stats.get_table_norm = get_table_norm
-    except Exception:
-        pass
-    page_frame("Statistica", Stats.render)
+    mod = page_modules.get("statistica")
+    if mod:
+        try:
+            setattr(mod, "tables", tables)
+            setattr(mod, "get_table", get_table)
+            setattr(mod, "get_table_norm", get_table_norm)
+        except Exception:
+            pass
+        page_frame("Statistica", getattr(mod, "render", lambda: st.error("render() missing")))
+    else:
+        st.error("Modulo Statistica non disponibile.")
+
 elif p == "probabilita":
-    try:
-        probability.tables = tables
-        probability.get_table = get_table
-        probability.get_table_norm = get_table_norm
-    except Exception:
-        pass
-    page_frame("Probabilità", probability.render)
+    mod = page_modules.get("probabilita")
+    if mod:
+        try:
+            setattr(mod, "tables", tables)
+            setattr(mod, "get_table", get_table)
+            setattr(mod, "get_table_norm", get_table_norm)
+        except Exception:
+            pass
+        page_frame("Probabilità", getattr(mod, "render", lambda: st.error("render() missing")))
+    else:
+        st.error("Modulo Probabilità non disponibile.")
+
 elif p == "attivita":
-    try:
-        atts.tables = tables
-        atts.get_table = get_table
-        atts.get_table_norm = get_table_norm
-    except Exception:
-        pass
-    page_frame("Attività TLK", atts.render)
+    mod = page_modules.get("attivita")
+    if mod:
+        try:
+            setattr(mod, "tables", tables)
+            setattr(mod, "get_table", get_table)
+            setattr(mod, "get_table_norm", get_table_norm)
+        except Exception:
+            pass
+        page_frame("Attività TLK", getattr(mod, "render", lambda: st.error("render() missing")))
+    else:
+        st.error("Modulo Attività non disponibile.")
+
 elif p == "operatore":
-    try:
-        operatore.tables = tables
-        operatore.get_table = get_table
-        operatore.get_table_norm = get_table_norm
-    except Exception:
-        pass
-    page_frame("Scheda Operatore", operatore.render)
+    mod = page_modules.get("operatore")
+    if mod:
+        try:
+            setattr(mod, "tables", tables)
+            setattr(mod, "get_table", get_table)
+            setattr(mod, "get_table_norm", get_table_norm)
+        except Exception:
+            pass
+        page_frame("Scheda Operatore", getattr(mod, "render", lambda: st.error("render() missing")))
+    else:
+        st.error("Modulo Operatore non disponibile.")
+
 else:
     goto("home")
+
+
