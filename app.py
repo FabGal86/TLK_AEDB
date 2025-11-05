@@ -275,8 +275,33 @@ if "page" not in st.session_state:
     st.session_state.page = "home"
 
 def goto(p: str):
+    """
+    Robust page switch + rerun:
+      - set session_state.page
+      - try st.experimental_rerun()
+      - fallback to st.rerun()
+      - final fallback: set flag and st.stop()
+    This avoids AttributeError on runtimes where experimental_rerun is missing.
+    """
     st.session_state.page = p
-    st.experimental_rerun()
+    # try experimental rerun then rerun
+    for fn in ("experimental_rerun", "rerun"):
+        try:
+            f = getattr(st, fn, None)
+            if callable(f):
+                f()
+                return
+        except Exception:
+            # continue to next option
+            continue
+    # final fallback: mark need for rerun and stop execution cleanly
+    st.session_state._need_rerun = True
+    # st.stop will end execution for this run. The UI will reflect session_state change on next rerun.
+    try:
+        st.stop()
+    except Exception:
+        # if even st.stop fails, raise a clear error so logs show something actionable
+        raise RuntimeError("Unable to rerun streamlit. Rerun methods not available in this runtime.")
 
 def page_frame(_title: str, body_fn):
     try:
@@ -436,5 +461,7 @@ elif p == "operatore":
 
 else:
     goto("home")
+
+
 
 
