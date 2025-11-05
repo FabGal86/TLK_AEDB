@@ -2,15 +2,17 @@
 from __future__ import annotations
 from typing import List, Optional, Dict, Tuple
 import io, time, re, unicodedata
+from pathlib import Path
+import base64, gzip
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from pathlib import Path
 
 # ================== COSTANTI ==================
 FALLBACK_SCHEMA = "aedbdata"
-ROW_LIMIT_PER_TABLE = 0
+ROW_LIMIT_PER_TABLE = 0  # 0 = usa tutte le righe
 DARK_BG = "#0f1113"
 FUXIA  = "#ff00ff"
 GREEN  = "#00ff66"
@@ -23,6 +25,9 @@ PINK   = "#e11d48"
 CYAN   = "#22d3ee"
 VIOLET = "#a78bfa"
 COMP_COLORS = [BLUE, TEAL, YELLOW, PINK, CYAN, VIOLET, "#ef4444", "#10b981", "#64748b"]
+
+PROJECT_DIR = Path(__file__).parent.resolve()
+DATA_DIR = PROJECT_DIR / "data"
 
 # ================== ALIAS ==================
 def _norm(s: str) -> str:
@@ -60,7 +65,12 @@ ALIAS_POSC  = [_norm(x) for x in [
     "positivi_ok","positivi_confirmed","confirmed"
 ]]
 
-# ================== DB-FREE LOADER (like EDA) ==================
+# ================== DATA LOADER (DB-FREE) ==================
+# prefer:
+# 1) app-injected: globals().get("tables") or get_table / get_table_norm
+# 2) dataset_embedded.py (auto-generated)
+# 3) CSV files under ./data/
+
 def _try_get_injected_table_names():
     try:
         gl_tables = globals().get("tables", None)
@@ -71,14 +81,6 @@ def _try_get_injected_table_names():
     return []
 
 def _try_get_injected_table(name: str) -> Optional[pd.DataFrame]:
-    try:
-        gl_tables = globals().get("tables", None)
-        if isinstance(gl_tables, dict) and name in gl_tables:
-            df = gl_tables[name]
-            if isinstance(df, pd.DataFrame):
-                return df
-    except Exception:
-        pass
     try:
         gf = globals().get("get_table", None)
         if callable(gf):
@@ -113,7 +115,8 @@ def _try_dataset_embedded_load(name: str) -> Optional[pd.DataFrame]:
         return None
 
 def _try_csv_load(name: str) -> Optional[pd.DataFrame]:
-    p1 = Path(__file__).parent.resolve() / "data" / f"{name}.csv"
+    # try various common locations and separators
+    p1 = PROJECT_DIR / "data" / f"{name}.csv"
     p2 = Path.cwd() / "data" / f"{name}.csv"
     candidates = [p1, p2]
     for p in candidates:
@@ -122,7 +125,7 @@ def _try_csv_load(name: str) -> Optional[pd.DataFrame]:
                 for sep in [';', ',', '\t', '|']:
                     try:
                         df = pd.read_csv(p, sep=sep, engine="python")
-                        if df.shape[1] > 0 or df.shape[0] > 0:
+                        if df.shape[1] > 1 or df.shape[0] > 0:
                             return df
                     except Exception:
                         continue
@@ -132,19 +135,17 @@ def _try_csv_load(name: str) -> Optional[pd.DataFrame]:
 
 @st.cache_data(ttl=60, show_spinner=False)
 def _current_db() -> str:
-    # No DB. Return fallback schema name.
     return FALLBACK_SCHEMA
 
 @st.cache_data(ttl=60, show_spinner=False)
 def _db_version(schema: str) -> str:
-    # Provide a simple version string based on current timestamp to mimic vkey behavior.
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
 @st.cache_data(ttl=60, show_spinner=False)
 def _list_tables(schema: str) -> pd.DataFrame:
     """
     Return available tables using (in order):
-      1) injected 'tables' dict
+      1) app-injected 'tables' dict
       2) dataset_embedded module
       3) CSV files in ./data
     """
@@ -175,7 +176,7 @@ def _list_tables(schema: str) -> pd.DataFrame:
 
     # 3) CSV in ./data
     try:
-        data_dir = Path(__file__).parent.resolve() / "data"
+        data_dir = PROJECT_DIR / "data"
         if data_dir.exists():
             for p in sorted(data_dir.glob("*.csv")):
                 rows.append({"table_name": p.stem, "table_type": "CSV", "table_rows": 0})
@@ -184,12 +185,10 @@ def _list_tables(schema: str) -> pd.DataFrame:
     except Exception:
         pass
 
-    # fallback empty frame
     return pd.DataFrame(columns=["table_name", "table_type", "table_rows"])
 
-
 @st.cache_data(ttl=60, show_spinner=False)
-def _load_table(schema: str, table: str, limit: int = 0) -> pd.DataFrame:
+def _load_table_sample(schema: str, table: str, limit: int = 0) -> pd.DataFrame:
     """
     Load table data using (in order):
       1) injected get_table / get_table_norm
@@ -197,13 +196,11 @@ def _load_table(schema: str, table: str, limit: int = 0) -> pd.DataFrame:
       3) ./data/{table}.csv with common separators
     Return a DataFrame (possibly empty).
     """
-    lim = int(limit) if limit and limit > 0 else None
-
     # 1) injected
     try:
         df = _try_get_injected_table(table)
         if isinstance(df, pd.DataFrame):
-            return df.head(lim) if lim else df
+            return df.head(limit) if limit and limit > 0 else df
     except Exception:
         pass
 
@@ -211,7 +208,7 @@ def _load_table(schema: str, table: str, limit: int = 0) -> pd.DataFrame:
     try:
         df = _try_dataset_embedded_load(table)
         if isinstance(df, pd.DataFrame):
-            return df.head(lim) if lim else df
+            return df.head(limit) if limit and limit > 0 else df
     except Exception:
         pass
 
@@ -219,11 +216,16 @@ def _load_table(schema: str, table: str, limit: int = 0) -> pd.DataFrame:
     try:
         df = _try_csv_load(table)
         if isinstance(df, pd.DataFrame):
-            return df.head(lim) if lim else df
+            return df.head(limit) if limit and limit > 0 else df
     except Exception:
         pass
 
     return pd.DataFrame()
+
+# A full load function (no sample)
+@st.cache_data(ttl=60, show_spinner=False)
+def _load_table(schema: str, table: str) -> pd.DataFrame:
+    return _load_table_sample(schema, table, limit=0)
 
 # ================== UTILS ==================
 def _norm_cols(df: pd.DataFrame) -> dict:
@@ -287,8 +289,10 @@ def _is_valid_month(m: str) -> bool:
 @st.cache_data(ttl=60, show_spinner=False)
 def _collect_filter_options(schema_now: str):
     mesi, att, op = set(), set(), set()
-    for _, r in _list_tables(schema_now).iterrows():
-        df = _load_table(schema_now, r["table_name"], ROW_LIMIT_PER_TABLE)
+    tbls = _list_tables(schema_now)
+    for _, r in tbls.iterrows():
+        tname = r["table_name"]
+        df = _load_table_sample(schema_now, tname, ROW_LIMIT_PER_TABLE)
         if df.empty: continue
         dcol = _find_col(df, ALIAS_DATA)
         if dcol:
@@ -306,8 +310,9 @@ def _collect_filter_options(schema_now: str):
 def _monthly_by_activity(schema_now: str,
                          mesi_sel: List[str], op_sel: List[str]) -> pd.DataFrame:
     rows = []
-    for _, r in _list_tables(schema_now).iterrows():
-        df = _load_table(schema_now, r["table_name"], ROW_LIMIT_PER_TABLE)
+    tbls = _list_tables(schema_now)
+    for _, r in tbls.iterrows():
+        df = _load_table(schema_now, r["table_name"])
         if df.empty: continue
 
         dcol = _find_col(df, ALIAS_DATA)
