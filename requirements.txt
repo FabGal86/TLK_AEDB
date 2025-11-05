@@ -1,0 +1,8 @@
+# requirements.txt — TLK AEDB app
+streamlit>=1.24.0
+pandas>=1.5.3
+numpy>=1.24.0
+plotly>=5.15.0
+matplotlib>=3.6.0
+scipy>=1.10.0
+streamlit-autorefresh>=0.1.7
